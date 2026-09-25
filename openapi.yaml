@@ -1,0 +1,180 @@
+openapi: 3.1.0
+info:
+  title: Cloudbase Ingest API
+  version: "1.0.0"
+  summary: Send skydiving jumps into a jumper's Cloudbase logbook.
+  description: |
+    Post the GPS track a device recorded for one jump. Cloudbase derives the
+    exit, opening and freefall numbers server-side, resolves the dropzone,
+    de-duplicates, and matches the track against everything else the jumper
+    has logged, so one physical jump never appears twice.
+
+    Authentication is a per-user token (`cb_pat_…`) that the jumper generates
+    in Cloudbase and gives to your app. It is write-only: it can add jumps to
+    that one logbook and nothing else.
+
+    The full guide, with the track format, retry rules and examples, is
+    README.md next to this file.
+  contact:
+    name: Cloudbase support
+    email: support@getcloudbase.com
+    url: https://getcloudbase.com
+  license:
+    name: CC BY 4.0
+    url: https://creativecommons.org/licenses/by/4.0/
+servers:
+  - url: https://api.getcloudbase.com
+    description: Production
+security:
+  - bearerAuth: []
+tags:
+  - name: Jumps
+    description: Add jumps to the authenticated jumper's logbook.
+paths:
+  /jumps/import-gps-csv:
+    post:
+      tags: [Jumps]
+      operationId: importTrack
+      summary: Import one jump from a device track
+      description: |
+        Send one jump per request. Safe to retry: the same track sent twice
+        returns `matchResult: skipped` with `skipReason: duplicate` and changes
+        nothing. Treat every 200 as done, including `skipped`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrackImport"
+            examples:
+              flysight:
+                summary: A FlySight jump (CSV cut to two samples)
+                value:
+                  deviceType: flysight
+                  deviceId: "flysight:0A1B2C3D"
+                  csv: |
+                    time,lat,lon,hMSL,velN,velE,velD,hAcc,vAcc,sAcc,heading,cAcc,gpsFix,numSV
+                    ,(deg),(deg),(m),(m/s),(m/s),(m/s),(m),(m),(m/s),(deg),(deg),,
+                    2026-06-06T10:15:00.000Z,52.1000359,-1.1999942,4000.000,20.00,2.00,0.00,2.100,3.400,0.45,5.7,1.8,3,16
+                    2026-06-06T10:15:00.200Z,52.1000701,-1.1999883,3999.584,19.02,2.00,2.08,2.100,3.400,0.45,6.0,1.8,3,16
+      responses:
+        "200":
+          description: Accepted. `matchResult` says what Cloudbase did with the track.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResult"
+              examples:
+                created:
+                  value: { jumpId: "8f3c1e90-2a4b-4c77-9e21-0b9d6e5a1f42", matchResult: created }
+                merged:
+                  value: { jumpId: "8f3c1e90-2a4b-4c77-9e21-0b9d6e5a1f42", matchResult: merged, matchConfidence: confident }
+                pendingReview:
+                  value: { jumpId: "", matchResult: pending_review }
+                duplicate:
+                  value: { jumpId: "8f3c1e90-2a4b-4c77-9e21-0b9d6e5a1f42", matchResult: skipped, skipReason: duplicate }
+        "400":
+          description: |
+            The body is malformed, the CSV isn't a usable track (fewer than 10
+            samples with a GPS fix, or imperial units), or the track doesn't
+            look like a skydive. Don't retry the same file.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: The token is missing, wrong or revoked. Stop and ask the user to connect again.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: The request body is over 40 MB.
+        "429":
+          description: Over 300 requests a minute for this token. Back off and retry.
+        "5XX":
+          description: Server-side failure. Retry with exponential backoff.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Per-user token, `cb_pat_` followed by 48 hex characters. The jumper
+        creates it under Connections → API tokens and can revoke it at any time.
+        Valid only for importing jumps.
+  schemas:
+    TrackImport:
+      type: object
+      required: [csv, deviceType]
+      properties:
+        csv:
+          type: string
+          maxLength: 40000000
+          description: |
+            The device's track file in FlySight CSV format: a header row, a units
+            row, then one row per GPS sample. Columns: time (ISO 8601 UTC), lat,
+            lon, hMSL (m), velN, velE, velD (m/s), hAcc, vAcc (m), sAcc (m/s),
+            heading, cAcc (deg), gpsFix, numSV, and an optional barometric
+            altitude (m). SI units only. FlySight 1 and 2 files are accepted as
+            written. Send the whole recording; the jump is found inside it.
+        deviceType:
+          type: string
+          enum: [flysight, skytrax]
+          description: |
+            The device that recorded the track. Cloudbase uses it to decide how
+            far to trust the track, so don't use `flysight` for another device's
+            data converted to the same format.
+
+            Always send it. The server still falls back to `skytrax` when it's
+            missing, for compatibility with early integrations.
+        deviceId:
+          type: string
+          minLength: 1
+          examples: ["flysight:0A1B2C3D"]
+          description: |
+            A stable id for the physical device, e.g. `<deviceType>:<serial>`.
+            Use the same value for every upload from that device.
+        isSimulated:
+          type: boolean
+          description: Marks a test upload. The jump is created but kept out of the jumper's stats.
+    ImportResult:
+      type: object
+      required: [jumpId, matchResult]
+      description: |
+        New fields and new enum values may be added. Ignore fields you don't
+        recognise, and treat an unknown `matchResult` as success.
+      properties:
+        jumpId:
+          type: string
+          description: |
+            The created or matched jump. Empty string for `pending_review`, and
+            for a `skipped` track that doesn't map to a live jump.
+        matchResult:
+          type: string
+          enum: [created, merged, pending_review, skipped]
+          description: |
+            `created`: nothing matched, so a new jump was created.
+            `merged`: added to a jump the user already had.
+            `pending_review`: a possible match, waiting in the user's inbox.
+            `skipped`: nothing to do (see `skipReason`).
+        matchConfidence:
+          type: string
+          enum: [confident, probable, ambiguous, no_match]
+          description: Present on some `merged` results.
+        skipReason:
+          type: string
+          enum: [duplicate, pending_duplicate, suppressed]
+          description: |
+            Present when `matchResult` is `skipped`.
+            `duplicate`: already imported.
+            `pending_duplicate`: already waiting in the user's inbox.
+            `suppressed`: the user deleted the jump this track made, so it won't be recreated.
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: A human-readable message.
+        details:
+          type: object
+          additionalProperties: true
+          description: Field-level validation detail on a malformed body. The shape may change.
